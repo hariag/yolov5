@@ -1,6 +1,6 @@
 import argparse
-import math
 import logging
+import math
 from copy import deepcopy
 from pathlib import Path
 
@@ -15,10 +15,13 @@ from utils.torch_utils import (
 
 logger = logging.getLogger(__name__)
 
+
 class Detect(nn.Module):
+    stride = None  # strides computed during build
+    export = False  # onnx export
+
     def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
         super(Detect, self).__init__()
-        self.stride = None  # strides computed during build
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -28,7 +31,6 @@ class Detect(nn.Module):
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
-        self.export = False  # onnx export
 
     def forward(self, x):
         # x = x.copy()  # for profiling
@@ -161,13 +163,13 @@ class Model(nn.Module):
             if type(m) is Conv:
                 m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatability
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
-                m.bn = None  # remove batchnorm
+                delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.fuseforward  # update forward
         self.info()
         return self
 
-    def info(self):  # print model information
-        model_info(self)
+    def info(self, verbose=False):  # print model information
+        model_info(self, verbose)
 
 
 def parse_model(d, ch):  # model_dict, input_channels(3)

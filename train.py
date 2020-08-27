@@ -1,9 +1,10 @@
 import argparse
+import logging
 import math
 import os
 import random
+import shutil
 import time
-import logging
 from pathlib import Path
 
 import numpy as np
@@ -30,18 +31,18 @@ from utils.torch_utils import init_seeds, ModelEMA, select_device, intersect_dic
 
 logger = logging.getLogger(__name__)
 
+
 def train(hyp, opt, device, tb_writer=None):
     logger.info(f'Hyperparameters {hyp}')
     log_dir = Path(tb_writer.log_dir) if tb_writer else Path(opt.logdir) / 'evolve'  # logging directory
-    wdir = str(log_dir / 'weights') + os.sep  # weights directory
+    wdir = log_dir / 'weights'  # weights directory
     os.makedirs(wdir, exist_ok=True)
-    last = wdir + 'last.pt'
-    best = wdir + 'best.pt'
+    last = wdir / 'last.pt'
+    best = wdir / 'best.pt'
     results_file = str(log_dir / 'results.txt')
     epochs, batch_size, total_batch_size, weights, rank = \
         opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank
 
-    # TODO: Use DDP logging. Only the first process is allowed to log.
     # Save run settings
     with open(log_dir / 'hyp.yaml', 'w') as f:
         yaml.dump(hyp, f, sort_keys=False)
@@ -129,9 +130,12 @@ def train(hyp, opt, device, tb_writer=None):
 
         # Epochs
         start_epoch = ckpt['epoch'] + 1
+        if opt.resume:
+            assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (weights, epochs)
+            shutil.copytree(wdir, wdir.parent / f'weights_backup_epoch{start_epoch - 1}')  # save previous weights
         if epochs < start_epoch:
             logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
-                  (weights, ckpt['epoch'], epochs))
+                        (weights, ckpt['epoch'], epochs))
             epochs += ckpt['epoch']  # finetune additional epochs
 
         del ckpt, state_dict
@@ -157,8 +161,8 @@ def train(hyp, opt, device, tb_writer=None):
         model = DDP(model, device_ids=[opt.local_rank], output_device=(opt.local_rank))
 
     # Trainloader
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt, hyp=hyp, augment=True,
-                                            cache=opt.cache_images, rect=opt.rect, rank=rank,
+    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
+                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers)
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
@@ -166,10 +170,10 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Testloader
     if rank in [-1, 0]:
-        # local_rank is set to -1. Because only the first process is expected to do evaluation.
-        testloader = create_dataloader(test_path, imgsz_test, total_batch_size, gs, opt, hyp=hyp, augment=False,
-                                       cache=opt.cache_images, rect=True, rank=-1, world_size=opt.world_size,
-                                       workers=opt.workers)[0]
+        ema.updates = start_epoch * nb // accumulate  # set EMA updates
+        testloader = create_dataloader(test_path, imgsz_test, total_batch_size, gs, opt,
+                                       hyp=hyp, augment=False, cache=opt.cache_images, rect=True, rank=-1,
+                                       world_size=opt.world_size, workers=opt.workers)[0]  # only runs on process 0
 
     # Model parameters
     hyp['cls'] *= nc / 80.  # scale coco-tuned hyp['cls'] to current dataset
@@ -221,7 +225,7 @@ def train(hyp, opt, device, tb_writer=None):
             if rank != -1:
                 indices = torch.zeros([dataset.n], dtype=torch.int)
                 if rank == 0:
-                    indices[:] = torch.from_tensor(dataset.indices, dtype=torch.int)
+                    indices[:] = torch.tensor(dataset.indices, dtype=torch.int)
                 dist.broadcast(indices, 0)
                 if rank != 0:
                     dataset.indices = indices.cpu().numpy()
@@ -261,18 +265,12 @@ def train(hyp, opt, device, tb_writer=None):
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
-            # Autocast
+            # Forward
             with amp.autocast(enabled=cuda):
-                # Forward
-                pred = model(imgs)
-
-                # Loss
-                loss, loss_items = compute_loss(pred, targets.to(device), model)  # scaled by batch_size
+                pred = model(imgs)  # forward
+                loss, loss_items = compute_loss(pred, targets.to(device), model)  # loss scaled by batch_size
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
-                # if not torch.isfinite(loss):
-                #     logger.info('WARNING: non-finite loss, ending training ', loss_items)
-                #     return results
 
             # Backward
             scaler.scale(loss).backward()
@@ -282,7 +280,7 @@ def train(hyp, opt, device, tb_writer=None):
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
-                if ema is not None:
+                if ema:
                     ema.update(model)
 
             # Print
@@ -304,19 +302,20 @@ def train(hyp, opt, device, tb_writer=None):
             # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
+        lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
         scheduler.step()
 
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
             # mAP
-            if ema is not None:
+            if ema:
                 ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 results, maps, times = test.test(opt.data,
                                                  batch_size=total_batch_size,
                                                  imgsz=imgsz_test,
-                                                 model=ema.ema.module if hasattr(ema.ema, 'module') else ema.ema,
+                                                 model=ema.ema,
                                                  single_cls=opt.single_cls,
                                                  dataloader=testloader,
                                                  save_dir=log_dir)
@@ -329,10 +328,11 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Tensorboard
             if tb_writer:
-                tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
+                tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
                         'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
-                        'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
-                for x, tag in zip(list(mloss[:-1]) + list(results), tags):
+                        'val/giou_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
+                        'x/lr0', 'x/lr1', 'x/lr2']  # params
+                for x, tag in zip(list(mloss[:-1]) + list(results) + lr, tags):
                     tb_writer.add_scalar(tag, x, epoch)
 
             # Update best mAP
@@ -347,7 +347,7 @@ def train(hyp, opt, device, tb_writer=None):
                     ckpt = {'epoch': epoch,
                             'best_fitness': best_fitness,
                             'training_results': f.read(),
-                            'model': ema.ema.module if hasattr(ema, 'module') else ema.ema,
+                            'model': ema.ema,
                             'optimizer': None if final_epoch else optimizer.state_dict()}
 
                 # Save last, best and delete
@@ -361,13 +361,13 @@ def train(hyp, opt, device, tb_writer=None):
     if rank in [-1, 0]:
         # Strip optimizers
         n = ('_' if len(opt.name) and not opt.name.isnumeric() else '') + opt.name
-        fresults, flast, fbest = 'results%s.txt' % n, wdir + 'last%s.pt' % n, wdir + 'best%s.pt' % n
-        for f1, f2 in zip([wdir + 'last.pt', wdir + 'best.pt', 'results.txt'], [flast, fbest, fresults]):
+        fresults, flast, fbest = 'results%s.txt' % n, wdir / f'last{n}.pt', wdir / f'best{n}.pt'
+        for f1, f2 in zip([wdir / 'last.pt', wdir / 'best.pt', 'results.txt'], [flast, fbest, fresults]):
             if os.path.exists(f1):
                 os.rename(f1, f2)  # rename
-                ispt = f2.endswith('.pt')  # is *.pt
-                strip_optimizer(f2) if ispt else None  # strip optimizer
-                os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket and ispt else None  # upload
+                if str(f2).endswith('.pt'):  # is *.pt
+                    strip_optimizer(f2)  # strip optimizer
+                    os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket else None  # upload
         # Finish
         if not opt.evolve:
             plot_results(save_dir=log_dir)  # save as results.png
@@ -388,8 +388,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='train,test sizes')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
-    parser.add_argument('--resume', nargs='?', const='get_last', default=False,
-                        help='resume from given path/last.pt, or most recent run if blank')
+    parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
     parser.add_argument('--noautoanchor', action='store_true', help='disable autoanchor check')
@@ -404,7 +403,7 @@ if __name__ == '__main__':
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--logdir', type=str, default='runs/', help='logging directory')
-    parser.add_argument('--workers', type=int, default=8, help='maximum number of workers for dataloader')
+    parser.add_argument('--workers', type=int, default=8, help='maximum number of dataloader workers')
     opt = parser.parse_args()
 
     # Set DDP variables
@@ -412,21 +411,26 @@ if __name__ == '__main__':
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
-
-    # Resume
-    if opt.resume:
-        last = get_latest_run() if opt.resume == 'get_last' else opt.resume  # resume from most recent run
-        if last and not opt.weights:
-            logger.info(f'Resuming training from {last}')
-        opt.weights = last if opt.resume and not opt.weights else opt.weights
-    if opt.global_rank in [-1,0]:
+    if opt.global_rank in [-1, 0]:
         check_git_status()
 
-    opt.hyp = opt.hyp or ('data/hyp.finetune.yaml' if opt.weights else 'data/hyp.scratch.yaml')
-    opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
-    assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
+    # Resume
+    if opt.resume:  # resume an interrupted run
+        ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
+        log_dir = Path(ckpt).parent.parent  # runs/exp0
+        assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
+        with open(log_dir / 'opt.yaml') as f:
+            opt = argparse.Namespace(**yaml.load(f, Loader=yaml.FullLoader))  # replace
+        opt.cfg, opt.weights, opt.resume = '', ckpt, True
+        logger.info('Resuming training from %s' % ckpt)
 
-    opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
+    else:
+        opt.hyp = opt.hyp or ('data/hyp.finetune.yaml' if opt.weights else 'data/hyp.scratch.yaml')
+        opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
+        assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
+        opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
+        log_dir = increment_dir(Path(opt.logdir) / 'exp', opt.name)  # runs/exp1
+
     device = select_device(opt.device, batch_size=opt.batch_size)
 
     # DDP mode
@@ -447,7 +451,7 @@ if __name__ == '__main__':
         tb_writer = None
         if opt.global_rank in [-1, 0]:
             logger.info('Start Tensorboard with "tensorboard --logdir %s", view at http://localhost:6006/' % opt.logdir)
-            tb_writer = SummaryWriter(log_dir=increment_dir(Path(opt.logdir) / 'exp', opt.name))  # runs/exp
+            tb_writer = SummaryWriter(log_dir=log_dir)  # runs/exp0
 
         train(hyp, opt, device, tb_writer)
 
