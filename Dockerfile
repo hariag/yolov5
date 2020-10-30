@@ -1,5 +1,5 @@
 # Start FROM Nvidia PyTorch image https://ngc.nvidia.com/catalog/containers/nvidia:pytorch
-FROM nvcr.io/nvidia/pytorch:20.08-py3
+FROM nvcr.io/nvidia/pytorch:20.10-py3
 
 # Install dependencies
 RUN pip install --upgrade pip
@@ -34,7 +34,7 @@ COPY . /usr/src/app
 # t=ultralytics/yolov5:latest && sudo docker pull $t && sudo docker run -it --ipc=host --gpus all -v "$(pwd)"/coco:/usr/src/coco $t
 
 # Kill all
-# sudo docker kill "$(sudo docker ps -q)"
+# sudo docker kill $(sudo docker ps -q)
 
 # Kill all image-based
 # sudo docker kill $(sudo docker ps -a -q --filter ancestor=ultralytics/yolov5:latest)

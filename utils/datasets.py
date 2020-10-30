@@ -1,5 +1,4 @@
 import glob
-import math
 import os
 import random
 import shutil
@@ -8,6 +7,7 @@ from pathlib import Path
 from threading import Thread
 
 import cv2
+import math
 import numpy as np
 import torch
 from PIL import Image, ExifTags
@@ -62,14 +62,48 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
-    dataloader = torch.utils.data.DataLoader(dataset,
-                                             batch_size=batch_size,
-                                             num_workers=nw,
-                                             sampler=train_sampler,
-                                             pin_memory=True,
-                                             collate_fn=LoadImagesAndLabels.collate_fn)
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+    dataloader = InfiniteDataLoader(dataset,
+                                    batch_size=batch_size,
+                                    num_workers=nw,
+                                    sampler=sampler,
+                                    pin_memory=True,
+                                    collate_fn=LoadImagesAndLabels.collate_fn)  # torch.utils.data.DataLoader()
     return dataloader, dataset
+
+
+class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
+    """ Dataloader that reuses workers.
+
+    Uses same syntax as vanilla DataLoader.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, 'batch_sampler', _RepeatSampler(self.batch_sampler))
+        self.iterator = super().__iter__()
+
+    def __len__(self):
+        return len(self.batch_sampler.sampler)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield next(self.iterator)
+
+
+class _RepeatSampler(object):
+    """ Sampler that repeats forever.
+
+    Args:
+        sampler (Sampler)
+    """
+
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    def __iter__(self):
+        while True:
+            yield from iter(self.sampler)
 
 
 class LoadImages:  # for inference
@@ -77,7 +111,7 @@ class LoadImages:  # for inference
         p = str(Path(path))  # os-agnostic
         p = os.path.abspath(p)  # absolute path
         if '*' in p:
-            files = sorted(glob.glob(p))  # glob
+            files = sorted(glob.glob(p, recursive=True))  # glob
         elif os.path.isdir(p):
             files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir
         elif os.path.isfile(p):
@@ -294,6 +328,20 @@ class LoadStreams:  # multiple IP or RTSP cameras
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1):
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.stride = stride
+
+        def img2label_paths(img_paths):
+            # Define label paths as a function of image paths
+            sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+            return [x.replace(sa, sb, 1).replace(os.path.splitext(x)[-1], '.txt') for x in img_paths]
+
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -309,30 +357,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     raise Exception('%s does not exist' % p)
             self.img_files = sorted(
                 [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats])
+            assert len(self.img_files) > 0, 'No images found'
         except Exception as e:
             raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, help_url))
 
-        n = len(self.img_files)
-        assert n > 0, 'No images found in %s. See %s' % (path, help_url)
-        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
-        nb = bi[-1] + 1  # number of batches
-
-        self.n = n  # number of images
-        self.batch = bi  # batch index of image
-        self.img_size = img_size
-        self.augment = augment
-        self.hyp = hyp
-        self.image_weights = image_weights
-        self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
-        self.mosaic_border = [-img_size // 2, -img_size // 2]
-        self.stride = stride
-
-        # Define labels
-        self.label_files = [x.replace('images', 'labels').replace(os.path.splitext(x)[-1], '.txt') for x in
-                            self.img_files]
-
         # Check cache
+        self.label_files = img2label_paths(self.img_files)  # labels
         cache_path = str(Path(self.label_files[0]).parent) + '.cache'  # cached labels
         if os.path.isfile(cache_path):
             cache = torch.load(cache_path)  # load
@@ -341,12 +371,21 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         else:
             cache = self.cache_labels(cache_path)  # cache
 
-        # Get labels
-        labels, shapes = zip(*[cache[x] for x in self.img_files])
-        self.shapes = np.array(shapes, dtype=np.float64)
+        # Read cache
+        cache.pop('hash')  # remove hash
+        labels, shapes = zip(*cache.values())
         self.labels = list(labels)
+        self.shapes = np.array(shapes, dtype=np.float64)
+        self.img_files = list(cache.keys())  # update
+        self.label_files = img2label_paths(cache.keys())  # update
 
-        # Rectangular Training  https://github.com/ultralytics/yolov3/issues/232
+        n = len(shapes)  # number of images
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+        self.batch = bi  # batch index of image
+        self.n = n
+
+        # Rectangular Training
         if self.rect:
             # Sort by aspect ratio
             s = self.shapes  # wh
@@ -370,7 +409,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
 
-        # Cache labels
+        # Check labels
         create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
         nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
         pbar = enumerate(self.label_files)
@@ -449,10 +488,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         for (img, label) in pbar:
             try:
                 l = []
-                image = Image.open(img)
-                image.verify()  # PIL verify
-                # _ = io.imread(img)  # skimage verify (from skimage import io)
-                shape = exif_size(image)  # image size
+                im = Image.open(img)
+                im.verify()  # PIL verify
+                shape = exif_size(im)  # image size
                 assert (shape[0] > 9) & (shape[1] > 9), 'image size <10 pixels'
                 if os.path.isfile(label):
                     with open(label, 'r') as f:
@@ -461,8 +499,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     l = np.zeros((0, 5), dtype=np.float32)
                 x[img] = [l, shape]
             except Exception as e:
-                x[img] = [None, None]
-                print('WARNING: %s: %s' % (img, e))
+                print('WARNING: Ignoring corrupted image and/or label %s: %s' % (img, e))
 
         x['hash'] = get_hash(self.label_files + self.img_files)
         torch.save(x, path)  # save for next time
@@ -482,7 +519,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             index = self.indices[index]
 
         hyp = self.hyp
-        if self.mosaic:
+        mosaic = self.mosaic and random.random() < hyp['mosaic']
+        if mosaic:
             # Load mosaic
             img, labels = load_mosaic(self, index)
             shapes = None
@@ -516,7 +554,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         if self.augment:
             # Augment imagespace
-            if not self.mosaic:
+            if not mosaic:
                 img, labels = random_perspective(img, labels,
                                                  degrees=hyp['degrees'],
                                                  translate=hyp['translate'],
@@ -626,7 +664,7 @@ def load_mosaic(self, index):
             x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
         elif i == 2:  # bottom left
             x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-            x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, max(xc, w), min(y2a - y1a, h)
+            x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
         elif i == 3:  # bottom right
             x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
             x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
@@ -648,14 +686,10 @@ def load_mosaic(self, index):
     # Concat/clip labels
     if len(labels4):
         labels4 = np.concatenate(labels4, 0)
-        # np.clip(labels4[:, 1:] - s / 2, 0, s, out=labels4[:, 1:])  # use with center crop
-        np.clip(labels4[:, 1:], 0, 2 * s, out=labels4[:, 1:])  # use with random_affine
-
-        # Replicate
-        # img4, labels4 = replicate(img4, labels4)
+        np.clip(labels4[:, 1:], 0, 2 * s, out=labels4[:, 1:])  # use with random_perspective
+        # img4, labels4 = replicate(img4, labels4)  # replicate
 
     # Augment
-    # img4 = img4[s // 2: int(s * 1.5), s // 2:int(s * 1.5)]  # center crop (WARNING, requires box pruning)
     img4, labels4 = random_perspective(img4, labels4,
                                        degrees=self.hyp['degrees'],
                                        translate=self.hyp['translate'],
@@ -700,7 +734,7 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
     new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
     if auto:  # minimum rectangle
-        dw, dh = np.mod(dw, 64), np.mod(dh, 64)  # wh padding
+        dw, dh = np.mod(dw, 32), np.mod(dh, 32)  # wh padding
     elif scaleFill:  # stretch
         dw, dh = 0.0, 0.0
         new_unpad = (new_shape[1], new_shape[0])
