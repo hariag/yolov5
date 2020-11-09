@@ -1,19 +1,22 @@
 import argparse
 import logging
-import math
+import sys
 from copy import deepcopy
 from pathlib import Path
+
+import math
+
+sys.path.append('./')  # to run '$ python *.py' files in subdirectories
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn as nn
 
-from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, Concat
+from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, Concat, NMS, autoShape
 from models.experimental import MixConv2d, CrossConv, C3
 from utils.general import check_anchor_order, make_divisible, check_file, set_logging
-from utils.torch_utils import (
-    time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, select_device)
-
-logger = logging.getLogger(__name__)
+from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
+    select_device, copy_attr
 
 
 class Detect(nn.Module):
@@ -71,7 +74,7 @@ class Model(nn.Module):
 
         # Define model
         if nc and nc != self.yaml['nc']:
-            print('Overriding %s nc=%g with nc=%g' % (cfg, self.yaml['nc'], nc))
+            print('Overriding model.yaml nc=%g with nc=%g' % (self.yaml['nc'], nc))
             self.yaml['nc'] = nc  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist, ch_out
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
@@ -138,6 +141,7 @@ class Model(nn.Module):
         return x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
+        # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
         for mi, s in zip(m.m, m.stride):  # from
@@ -160,13 +164,32 @@ class Model(nn.Module):
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
         print('Fusing layers... ')
         for m in self.model.modules():
-            if type(m) is Conv:
-                m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatability
+            if type(m) is Conv and hasattr(m, 'bn'):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.fuseforward  # update forward
         self.info()
         return self
+
+    def nms(self, mode=True):  # add or remove NMS module
+        present = type(self.model[-1]) is NMS  # last layer is NMS
+        if mode and not present:
+            print('Adding NMS... ')
+            m = NMS()  # module
+            m.f = -1  # from
+            m.i = self.model[-1].i + 1  # index
+            self.model.add_module(name='%s' % m.i, module=m)  # add
+            self.eval()
+        elif not mode and present:
+            print('Removing NMS... ')
+            self.model = self.model[:-1]  # remove
+        return self
+
+    def autoshape(self):  # add autoShape module
+        print('Adding autoShape... ')
+        m = autoShape(self)  # wrap model
+        copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
+        return m
 
     def info(self, verbose=False):  # print model information
         model_info(self, verbose)
@@ -188,7 +211,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [nn.Conv2d, Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3]:
+        if m in [Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP, C3]:
             c1, c2 = ch[f], args[0]
 
             # Normal
@@ -251,10 +274,6 @@ if __name__ == '__main__':
     # Profile
     # img = torch.rand(8 if torch.cuda.is_available() else 1, 3, 640, 640).to(device)
     # y = model(img, profile=True)
-
-    # ONNX export
-    # model.model[-1].export = True
-    # torch.onnx.export(model, img, opt.cfg.replace('.yaml', '.onnx'), verbose=True, opset_version=11)
 
     # Tensorboard
     # from torch.utils.tensorboard import SummaryWriter
