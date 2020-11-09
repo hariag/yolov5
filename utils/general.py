@@ -1,5 +1,6 @@
 import glob
 import logging
+import math
 import os
 import platform
 import random
@@ -12,7 +13,6 @@ from copy import copy
 from pathlib import Path
 
 import cv2
-import math
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -589,7 +589,7 @@ def build_targets(p, targets, model):
 
         # Append
         a = t[:, 6].long()  # anchor indices
-        indices.append((b, a, gj, gi))  # image, anchor, grid indices
+        indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
         tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
         anch.append(anchors[a])  # anchors
         tcls.append(c)  # class
@@ -955,9 +955,15 @@ def increment_dir(dir, comment=''):
     # Increments a directory runs/exp1 --> runs/exp2_comment
     n = 0  # number
     dir = str(Path(dir))  # os-agnostic
+    if os.path.isdir(dir):
+        stem = ''
+        dir += os.sep  # removed by Path
+    else:
+        stem = Path(dir).stem
+
     dirs = sorted(glob.glob(dir + '*'))  # directories
     if dirs:
-        matches = [re.search(r"exp(\d+)", d) for d in dirs]
+        matches = [re.search(r"%s(\d+)" % stem, d) for d in dirs]
         idxs = [int(m.groups()[0]) for m in matches if m]
         if idxs:
             n = max(idxs) + 1  # increment
@@ -1096,7 +1102,8 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
         cv2.rectangle(mosaic, (block_x, block_y), (block_x + w, block_y + h), (255, 255, 255), thickness=3)
 
     if fname is not None:
-        mosaic = cv2.resize(mosaic, (int(ns * w * 0.5), int(ns * h * 0.5)), interpolation=cv2.INTER_AREA)
+        r = min(1280. / max(h, w) / ns, 1.0)  # ratio to limit image size
+        mosaic = cv2.resize(mosaic, (int(ns * w * r), int(ns * h * r)), interpolation=cv2.INTER_AREA)
         # cv2.imwrite(fname, cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB))  # cv2 save
         Image.fromarray(mosaic).save(fname)  # PIL save
     return mosaic
@@ -1261,7 +1268,7 @@ def plot_results_overlay(start=0, stop=0):  # from utils.general import *; plot_
 
 
 def plot_results(start=0, stop=0, bucket='', id=(), labels=(), save_dir=''):
-    # from utils.general import *; plot_results(save_dir='runs/exp0')
+    # from utils.general import *; plot_results(save_dir='runs/train/exp0')
     # Plot training 'results*.txt' as seen in https://github.com/ultralytics/yolov5#reproduce-our-training
     fig, ax = plt.subplots(2, 5, figsize=(12, 6))
     ax = ax.ravel()

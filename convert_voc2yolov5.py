@@ -6,18 +6,19 @@ import shutil
 
 ignore_diff=True
 
-classes=["person"]
-f ="/home/haria/yolov5-master/data/VOC2007/ImageSets/train.txt"
+classes=['person', 'face', 'employee_card', 'practising_certificate', 'contract', 'identity_card']
+stage=sys.argv[1]
+f ="/media/haria/data/MobileNet-YOLO/data/VOCdevkit/VOC2007/ImageSets/"+stage+".txt"
 dirname = os.path.dirname(os.path.dirname(f))
 rootdir = os.path.dirname(dirname)
 jpegfolder = os.path.join(dirname,"JPEGImages")
 annofolder = os.path.join(dirname,"Annotations")
 print (rootdir, jpegfolder, annofolder)
-annotations = [l.strip() for l in open(f,"rb").readlines()]
+annotations = [l.decode().strip() for l in open(f,"rb").readlines()]
 
 for annotation in annotations:
-    labels = "VOC/labels/train/"+annotation.replace("/","_") + ".txt"
-    images = "VOC/images/train/"+annotation.replace("/","_") + ".jpg"
+    labels = "VOC/labels/"+stage+"/"+annotation.replace("/","_") + ".txt"
+    images = "VOC/images/"+stage+"/"+annotation.replace("/","_") + ".jpg"
     
     if not os.path.exists(os.path.dirname(labels)):
         os.makedirs(os.path.dirname(labels))
@@ -62,10 +63,10 @@ for annotation in annotations:
         obj = jdata["annotation"]["object"]
         if obj["name"] not in classes:
             continue
-        x1 = int(float(obj["bndbox"]["xmin"]))
-        y1 = int(float(obj["bndbox"]["ymin"]))
-        x2 = int(float(obj["bndbox"]["xmax"]))
-        y2 = int(float(obj["bndbox"]["ymax"]))
+        x1 = float(obj["bndbox"]["xmin"])
+        y1 = float(obj["bndbox"]["ymin"])
+        x2 = float(obj["bndbox"]["xmax"])
+        y2 = float(obj["bndbox"]["ymax"])
         x1 = x1 if (x1>=1) else 1
         y1 = y1 if (y1>=1) else 1
         x2 = x2 if (x2<w) else (w-1)
@@ -74,9 +75,9 @@ for annotation in annotations:
         bbox_h = y2 - y1
 
         x1 = x1/w
-        y1 = y1/h
         x2 = x2/w
-        y2 = y2/w
+        y1 = y1/h 
+        y2 = y2/h
         center_x = (x1 + x2)/2.0
         center_y = (y1 + y2)/2.0
         ww = bbox_w/w
@@ -90,10 +91,10 @@ for annotation in annotations:
         for obj in jdata["annotation"]["object"]:
             if obj["name"] not in classes:
                 continue
-            x1 = int(obj["bndbox"]["xmin"])  
-            y1 = int(obj["bndbox"]["ymin"]) 
-            x2 = int(obj["bndbox"]["xmax"]) 
-            y2 = int(obj["bndbox"]["ymax"])
+            x1 = float(obj["bndbox"]["xmin"])  
+            y1 = float(obj["bndbox"]["ymin"]) 
+            x2 = float(obj["bndbox"]["xmax"]) 
+            y2 = float(obj["bndbox"]["ymax"])
             x1 = x1 if (x1>=0) else 0
             y1 = y1 if (y1>=0) else 0
             x2 = x2 if (x2<w) else (w-1)
@@ -104,7 +105,7 @@ for annotation in annotations:
             x1 = x1/w
             y1 = y1/h
             x2 = x2/w
-            y2 = y2/w
+            y2 = y2/h
             center_x = (x1 + x2)/2.0
             center_y = (y1 + y2)/2.0
             ww = bbox_w/w
@@ -117,7 +118,7 @@ for annotation in annotations:
         continue
     f=open(labels,"wb")
     for keep in keeps:
-        f.write(keep)
+        f.write(keep.encode())
     f.flush()
     f.close()
     shutil.copy(jpeg, images)
